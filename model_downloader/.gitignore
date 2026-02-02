@@ -1,0 +1,25 @@
+# Model Downloader configuration files
+.model_downloader.key
+model_downloader_config.json
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Development files
+*.log
+*.sql
+*.sqlite
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
