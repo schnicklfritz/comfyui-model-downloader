@@ -2,6 +2,8 @@ import subprocess
 import os
 import json
 import base64
+import urllib.request
+import sys
 from urllib.parse import urlparse
 from pathlib import Path
 from cryptography.fernet import Fernet
@@ -15,295 +17,192 @@ try:
 except ImportError:
     FOLDER_PATHS_AVAILABLE = False
 
+# Check if rclone is available
+def check_rclone():
+    try:
+        subprocess.run(['rclone', '--version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+RCLONE_AVAILABLE = check_rclone()
+
 class ConfigManager:
     def __init__(self, config_dir=None):
         if config_dir is None:
-            # Use the custom node directory
             config_dir = Path(__file__).parent
         
         self.config_dir = Path(config_dir)
         self.config_file = self.config_dir / "model_downloader_config.json"
         self.key_file = self.config_dir / ".model_downloader.key"
-        
-        # Ensure config directory exists
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize or load encryption key
         self._init_encryption_key()
     
     def _init_encryption_key(self):
-        """Initialize or load the encryption key"""
         if not self.key_file.exists():
-            # Generate new key
             key = Fernet.generate_key()
             self.key_file.write_bytes(key)
-            # Add to .gitignore
             self._add_to_gitignore()
         
-        # Load key
         key = self.key_file.read_bytes()
         self.cipher = Fernet(key)
     
     def _add_to_gitignore(self):
-        """Add config files to .gitignore"""
         gitignore = self.config_dir / ".gitignore"
         ignore_entries = [
             ".model_downloader.key",
-            "model_downloader_config.json",
-            "__pycache__/",
-            "*.pyc"
+            "model_downloader_config.json"
         ]
         
-        existing = set()
+        existing = []
         if gitignore.exists():
-            existing = set(gitignore.read_text().splitlines())
+            existing = gitignore.read_text().splitlines()
         
-        new_entries = [entry for entry in ignore_entries if entry not in existing]
-        if new_entries:
-            with open(gitignore, 'a') as f:
-                f.write('\n' + '\n'.join(new_entries) + '\n')
+        with open(gitignore, 'a') as f:
+            for entry in ignore_entries:
+                if entry not in existing:
+                    f.write(f"\n{entry}")
     
-    def encrypt_data(self, data):
-        """Encrypt data dictionary"""
-        json_str = json.dumps(data)
-        encrypted = self.cipher.encrypt(json_str.encode())
-        return base64.b64encode(encrypted).decode()
-    
-    def decrypt_data(self, encrypted_str):
-        """Decrypt data to dictionary"""
-        encrypted = base64.b64decode(encrypted_str.encode())
-        decrypted = self.cipher.decrypt(encrypted)
-        return json.loads(decrypted.decode())
-    
-    def load_config(self):
-        """Load and decrypt config file"""
-        if not self.config_file.exists():
-            return {"last_used_remote": None, "remotes": {}}
+    def save_remote(self, name, config):
+        all_config = self._load_config()
+        encrypted_config = {}
+        for key, value in config.items():
+            if value and key in ['access_key_id', 'secret_access_key']:
+                encrypted_config[key] = self.cipher.encrypt(value.encode()).decode()
+            else:
+                encrypted_config[key] = value
         
-        try:
-            encrypted_data = self.config_file.read_text()
-            return self.decrypt_data(encrypted_data)
-        except Exception as e:
-            print(f"Error loading config: {e}")
-            return {"last_used_remote": None, "remotes": {}}
+        all_config['remotes'] = all_config.get('remotes', {})
+        all_config['remotes'][name] = encrypted_config
+        self._save_config(all_config)
     
-    def save_config(self, config):
-        """Encrypt and save config file"""
-        encrypted_data = self.encrypt_data(config)
-        self.config_file.write_text(encrypted_data)
-    
-    def save_remote(self, remote_name, remote_config):
-        """Save or update remote configuration"""
-        config = self.load_config()
-        
-        # Update or add remote
-        config["remotes"][remote_name] = remote_config
-        config["last_used_remote"] = remote_name
-        
-        self.save_config(config)
-        return True
-    
-    def get_remote(self, remote_name=None):
-        """Get remote configuration by name, or last used remote"""
-        config = self.load_config()
-        
-        if remote_name:
-            return config["remotes"].get(remote_name)
-        elif config["last_used_remote"]:
-            return config["remotes"].get(config["last_used_remote"])
-        else:
+    def get_remote(self, name):
+        all_config = self._load_config()
+        remotes = all_config.get('remotes', {})
+        if name not in remotes:
             return None
+        
+        config = remotes[name].copy()
+        for key in ['access_key_id', 'secret_access_key']:
+            if config.get(key):
+                try:
+                    config[key] = self.cipher.decrypt(config[key].encode()).decode()
+                except:
+                    pass
+        
+        return config
     
-    def list_remotes(self):
-        """List all saved remotes"""
-        config = self.load_config()
-        return list(config["remotes"].keys())
+    def _load_config(self):
+        if self.config_file.exists():
+            return json.loads(self.config_file.read_text())
+        return {}
+    
+    def _save_config(self, config):
+        self.config_file.write_text(json.dumps(config, indent=2))
 
 
 class ModelDownloaderNode:
-    # Comprehensive list of rclone providers
-    RCLONE_PROVIDERS = [
-        "s3", "b2", "google cloud storage", "azureblob", "dropbox", "ftp", "http", "webdav",
-        "onedrive", "box", "mega", "pcloud", "putio", "seafile", "sharefile", "sugarsync",
-        "yandex", "hubic", "jottacloud", "koofr", "mailru", "premiumize", "tardigrade",
-        "union", "chunker", "crypt", "hasher", "cache", "alias", "local", "chacha", "null",
-        "compress", "combine", "drive", "opendrive", "hidrive", "internetarchive", "mailru",
-        "memset", "openstack", "qingstor", "stackpath", "vultr", "wasabi", "backblaze",
-        "digitalocean", "dreamhost", "gcs", "ibmcos", "idrive", "ionos", "linode", "oracle",
-        "scaleway", "storj", "tencent", "ucloud", "ceph", "minio", "petabox", "swift",
-        "obs", "oss", "cos", "ks3", "eos", "gphotos", "photos", "smb", "nfs", "sftp",
-        "ftp", "ftps", "dav", "webdav", "http", "https", "s3ql", "storj", "tardigrade"
-    ]
+    def __init__(self):
+        self.config_manager = ConfigManager()
     
     @classmethod
     def INPUT_TYPES(cls):
+        destinations = ["Local Pod"]
+        if RCLONE_AVAILABLE:
+            destinations.append("Cloud Storage")
+        
         return {
             "required": {
-                "url": ("STRING", {
-                    "multiline": False,
-                    "default": ""
-                }),
-                "destination": (["Local Pod", "Cloud Storage"], {
-                    "default": "Local Pod"
-                }),
+                "url": ("STRING", {"default": "https://"}),
+                "destination": (destinations,),
             },
             "optional": {
-                "remote_name": ("STRING", {
-                    "multiline": False,
-                    "default": "",
-                    "tooltip": "Name for this remote configuration (e.g., 'myb2', 'mys3')"
-                }),
-                "provider": (cls.RCLONE_PROVIDERS, {
-                    "default": "s3",
-                    "tooltip": "Cloud storage provider"
-                }),
-                "access_key_id": ("STRING", {
-                    "multiline": False,
-                    "default": "",
-                    "tooltip": "Access key ID for cloud storage"
-                }),
-                "secret_access_key": ("STRING", {
-                    "multiline": False,
-                    "default": "",
-                    "tooltip": "Secret access key for cloud storage",
-                    "password": True
-                }),
-                "bucket": ("STRING", {
-                    "multiline": False,
-                    "default": "",
-                    "tooltip": "Bucket name"
-                }),
-                "endpoint": ("STRING", {
-                    "multiline": False,
-                    "default": "",
-                    "tooltip": "Custom endpoint URL (optional)"
-                }),
-                "region": ("STRING", {
-                    "multiline": False,
-                    "default": "",
-                    "tooltip": "Region for S3-compatible storage (optional)"
-                }),
+                "remote_name": ("STRING", {"default": "myremote"}),
+                "provider": (["s3", "b2", "gcs", "azure"], {"default": "s3"}),
+                "access_key_id": ("STRING", {"default": ""}),
+                "secret_access_key": ("STRING", {"default": ""}),
+                "bucket": ("STRING", {"default": ""}),
+                "endpoint": ("STRING", {"default": ""}),
+                "region": ("STRING", {"default": "us-east-1"}),
             }
         }
     
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("file_path",)
     FUNCTION = "download_model"
-    CATEGORY = "utils"
-    OUTPUT_NODE = True
-    
-    def __init__(self):
-        self.config_manager = ConfigManager()
+    CATEGORY = "Model Management"
     
     def _extract_filename(self, url):
-        """Extract filename from URL"""
-        parsed_url = urlparse(url)
-        filename = os.path.basename(parsed_url.path)
-        
-        if not filename:
-            # If no filename in URL, use a default
-            filename = "downloaded_model.safetensors"
-        
-        return filename
+        parsed = urlparse(url)
+        filename = os.path.basename(parsed.path)
+        return filename if filename else "downloaded_model.safetensors"
     
-    def _setup_rclone_env(self, remote_name, remote_config):
-        """Setup rclone environment variables for dynamic configuration"""
-        # Clear any existing RCLONE_CONFIG_* environment variables for this remote
-        prefix = f"RCLONE_CONFIG_{remote_name.upper()}_"
-        for key in list(os.environ.keys()):
-            if key.startswith(prefix):
-                del os.environ[key]
+    def _download_with_progress(self, url, dest_path):
+        """Download file with progress bar (no rclone needed)"""
+        print(f"Downloading: {url}")
+        print(f"To: {dest_path}")
         
-        # Set provider type
-        os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_TYPE'] = remote_config['provider']
+        def progress(block_num, block_size, total_size):
+            downloaded = block_num * block_size
+            percent = min(downloaded * 100 / total_size, 100) if total_size > 0 else 0
+            sys.stdout.write(f"\r[{'=' * int(percent/2):{50}}] {percent:.1f}%")
+            sys.stdout.flush()
         
-        # Set credentials
-        if 'access_key_id' in remote_config:
-            os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_ACCESS_KEY_ID'] = remote_config['access_key_id']
-        if 'secret_access_key' in remote_config:
-            os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_SECRET_ACCESS_KEY'] = remote_config['secret_access_key']
-        
-        # Set optional fields
-        if 'bucket' in remote_config and remote_config['bucket']:
-            os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_BUCKET'] = remote_config['bucket']
-        if 'endpoint' in remote_config and remote_config['endpoint']:
-            os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_ENDPOINT'] = remote_config['endpoint']
-        if 'region' in remote_config and remote_config['region']:
-            os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_REGION'] = remote_config['region']
-        
-        # Provider-specific configurations
-        provider = remote_config['provider'].lower()
-        if provider == 's3':
-            os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_PROVIDER'] = 'AWS'
-        elif provider == 'google cloud storage':
-            os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_PROVIDER'] = 'GCS'
-        elif provider == 'azureblob':
-            os.environ[f'RCLONE_CONFIG_{remote_name.upper()}_PROVIDER'] = 'AzureBlob'
+        try:
+            urllib.request.urlretrieve(url, dest_path, progress)
+            print("\n✓ Download complete")
+        except Exception as e:
+            raise Exception(f"Download failed: {str(e)}")
     
     def _validate_cloud_credentials(self, remote_name, provider, access_key_id, secret_access_key, bucket):
-        """Validate required fields for cloud storage"""
         if not remote_name:
-            raise ValueError("Remote name is required for cloud storage")
-        
-        if not provider:
-            raise ValueError("Provider is required for cloud storage")
-        
-        if not access_key_id or not secret_access_key:
-            # Check if we have saved credentials
-            saved_config = self.config_manager.get_remote(remote_name)
-            if not saved_config:
-                raise ValueError("No credentials provided and no saved configuration found")
-        
+            raise ValueError("Remote name is required")
         if not bucket:
-            raise ValueError("Bucket name is required for cloud storage")
+            raise ValueError("Bucket name is required")
+    
+    def _setup_rclone_env(self, remote_name, config):
+        env_vars = {
+            f"RCLONE_CONFIG_{remote_name.upper()}_TYPE": config['provider'],
+            f"RCLONE_CONFIG_{remote_name.upper()}_ACCESS_KEY_ID": config['access_key_id'],
+            f"RCLONE_CONFIG_{remote_name.upper()}_SECRET_ACCESS_KEY": config['secret_access_key'],
+        }
         
-        return True
+        if config.get('endpoint'):
+            env_vars[f"RCLONE_CONFIG_{remote_name.upper()}_ENDPOINT"] = config['endpoint']
+        if config.get('region'):
+            env_vars[f"RCLONE_CONFIG_{remote_name.upper()}_REGION"] = config['region']
+        
+        os.environ.update(env_vars)
     
     def download_model(self, url, destination, remote_name="", provider="s3", 
                       access_key_id="", secret_access_key="", bucket="", 
-                      endpoint="", region=""):
-        # Extract filename from URL
+                      endpoint="", region="us-east-1"):
+        
         filename = self._extract_filename(url)
         
-        # Check if rclone is installed
-        try:
-            subprocess.run(['rclone', '--version'], capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            raise Exception("rclone command not found. Please install rclone.")
-        
-        # Determine destination path based on selection
         if destination == "Local Pod":
-            # Use folder_paths to get the checkpoints directory
+            # Get ComfyUI checkpoints directory
             try:
-                checkpoints_dir = folder_paths.get_folder_paths("checkpoints")[0]
+                if FOLDER_PATHS_AVAILABLE:
+                    checkpoints_dir = folder_paths.get_folder_paths("checkpoints")[0]
+                else:
+                    checkpoints_dir = "/root/ComfyUI/models/checkpoints"
             except:
-                # Fallback to default path
-                checkpoints_dir = "/workspace/ComfyUI/models/checkpoints"
+                checkpoints_dir = "/root/ComfyUI/models/checkpoints"
             
-            # Create directory if needed
             os.makedirs(checkpoints_dir, exist_ok=True)
-            
             destination_path = os.path.join(checkpoints_dir, filename)
             
-            # Run rclone copyurl command
-            try:
-                result = subprocess.run(
-                    ['rclone', 'copyurl', url, destination_path],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                print(f"Download successful: {result.stdout}")
-            except subprocess.CalledProcessError as e:
-                error_msg = e.stderr if e.stderr else "Unknown error"
-                print(f"Download failed: {error_msg}")
-                raise Exception(f"Failed to download model: {error_msg}")
+            # Use native Python download (no rclone required)
+            self._download_with_progress(url, destination_path)
+            print(f"✓ Saved to: {destination_path}")
         
         elif destination == "Cloud Storage":
+            if not RCLONE_AVAILABLE:
+                raise Exception("Cloud storage requires rclone. Install with: apt install rclone")
+            
             # Validate cloud credentials
             self._validate_cloud_credentials(remote_name, provider, access_key_id, secret_access_key, bucket)
             
-            # Prepare remote configuration
             remote_config = {
                 'provider': provider,
                 'access_key_id': access_key_id,
@@ -313,49 +212,33 @@ class ModelDownloaderNode:
                 'region': region
             }
             
-            # Check if we have credentials provided or need to use saved ones
             if access_key_id and secret_access_key:
-                # Save credentials to config
                 self.config_manager.save_remote(remote_name, remote_config)
-                print(f"Saved credentials for remote: {remote_name}")
+                print(f"✓ Saved credentials for: {remote_name}")
             else:
-                # Use saved credentials
                 saved_config = self.config_manager.get_remote(remote_name)
                 if not saved_config:
-                    raise Exception("No saved credentials found. Please provide credentials or configure cloud storage first.")
-                
-                # Update remote_config with saved values
+                    raise Exception("No saved credentials. Please provide credentials.")
                 remote_config.update(saved_config)
-                print(f"Using saved credentials for remote: {remote_name}")
             
-            # Setup rclone environment variables
             self._setup_rclone_env(remote_name, remote_config)
-            
-            # Destination path for cloud storage
             destination_path = f"{remote_name}:{bucket}/{filename}"
             
-            # Run rclone copyurl command
             try:
                 result = subprocess.run(
                     ['rclone', 'copyurl', url, destination_path],
-                    capture_output=True,
-                    text=True,
-                    check=True
+                    capture_output=True, text=True, check=True
                 )
-                print(f"Upload to cloud storage successful: {result.stdout}")
+                print(f"✓ Uploaded to cloud: {result.stdout}")
             except subprocess.CalledProcessError as e:
-                error_msg = e.stderr if e.stderr else "Unknown error"
-                print(f"Upload failed: {error_msg}")
-                raise Exception(f"Failed to upload to cloud storage: {error_msg}")
+                raise Exception(f"Cloud upload failed: {e.stderr}")
         
         else:
             raise ValueError(f"Unknown destination: {destination}")
         
-        # Return the file path
         return (destination_path,)
 
 
-# Node export
 NODE_CLASS_MAPPINGS = {
     "ModelDownloaderNode": ModelDownloaderNode
 }
