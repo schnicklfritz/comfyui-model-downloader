@@ -1,0 +1,14 @@
+# Exclude everything not explicitly needed in production
+**/*.md
+**/*.txt
+.git
+.gitignore
+.dockerignore
+forge/                    # Development files
+examples/                 # Example files
+**/__pycache__/
+**/*.pyc
+**/test_*
+**/tmp/
+**/temp/
+**/.DS_Store

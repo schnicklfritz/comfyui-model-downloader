@@ -1,0 +1,39 @@
+# Development Golemite Forge - Arch Linux base
+FROM archlinux:base-devel AS forge
+
+# Install ALL development tools
+RUN pacman -Syu --noconfirm --needed \
+    git \
+    python \
+    python-pip \
+    python-virtualenv \
+    xorg-server-xvfb \
+    x11vnc \
+    novnc \
+    chromium \
+    firefox \
+    wget \
+    curl \
+    jq \
+    htop \
+    neovim \
+    && pacman -Scc --noconfirm
+
+# Set up Python development environment
+RUN pip install --no-cache-dir \
+    playwright \
+    pytest \
+    pytest-asyncio \
+    ipython \
+    black \
+    flake8
+
+# Install browsers for Playwright
+RUN playwright install --with-deps chromium firefox
+
+# Create workspace
+RUN mkdir -p /workspace/formations && chmod 777 /workspace
+WORKDIR /workspace
+
+# Default command
+CMD ["/bin/bash"]

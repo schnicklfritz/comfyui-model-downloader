@@ -1,0 +1,57 @@
+name: CI Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  lint-dockerfiles:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Hadolint - Dockerfile linter
+      uses: hadolint/hadolint-action@v3.1.0
+      with:
+        dockerfile: |
+          clay/Dockerfile.alpine
+          forge/Dockerfile.arch
+        failure-threshold: warning
+
+  test-formations:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install pytest pytest-asyncio
+        pip install -r clay/requirements.txt
+    
+    - name: Test formation imports
+      run: |
+        python -c "
+        import sys
+        sys.path.insert(0, 'formations')
+        try:
+            from base import BaseFormation
+            print('✓ BaseFormation imports correctly')
+            
+            # Try to import all formations
+            import os
+            for file in os.listdir('formations'):
+                if file.endswith('.py') and file != '__init__.py' and file != 'base.py':
+                    mod_name = file[:-3]
+                    __import__(f'formations.{mod_name}')
+                    print(f'✓ {mod_name} imports correctly')
+        except Exception as e:
+            print(f'✗ Import error: {e}')
+            sys.exit(1)
+        "

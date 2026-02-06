@@ -1,0 +1,27 @@
+# Docker
+*.tar
+*.tar.gz
+docker-compose.override.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Dev files
+test_*
+tmp/
+temp/

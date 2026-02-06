@@ -1,0 +1,56 @@
+# Production Golemite Clay - Minimal Alpine base
+FROM alpine:3.19 AS bedrock
+
+# Build arguments for specialization
+ARG FORMATION="base"
+ARG BUILD_DATE
+ARG VERSION="1.0.0"
+
+# Label for clarity
+LABEL org.opencontainers.image.title="Golemite Clay"
+LABEL org.opencontainers.image.description="Minimal satellite body for Golemite"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL formation="${FORMATION}"
+
+# Install ONLY what's needed for runtime
+RUN apk add --no-cache \
+    chromium \
+    chromium-chromedriver \
+    xvfb \
+    fluxbox \
+    x11vnc \
+    novnc \
+    python3 \
+    py3-pip \
+    bash \
+    curl \
+    && rm -rf /var/cache/apk/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt \
+    && rm requirements.txt
+
+# Install Playwright browser (but not dev dependencies)
+RUN python3 -m playwright install chromium --with-deps
+
+# Copy application files
+COPY animate.sh /usr/local/bin/
+COPY mission.py /golemite/
+COPY formations/ /golemite/formations/
+
+# Create non-root user for security
+RUN adduser -D -u 1000 golemite \
+    && chown -R golemite:golemite /golemite
+USER golemite
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/ || exit 1
+
+# Expose ports: noVNC web UI, VNC, and API
+EXPOSE 8080 5900 5000
+
+# Start command
+ENTRYPOINT ["/usr/local/bin/animate.sh"]
+CMD ["--formation", "${FORMATION}"]
