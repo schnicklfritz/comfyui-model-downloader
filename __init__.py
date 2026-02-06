@@ -1,184 +1,225 @@
 import os
-import requests
-import sys
-from urllib.parse import urlparse
+import subprocess
+import shutil
 from pathlib import Path
 
-# Try to import folder_paths (ComfyUI specific)
 try:
     import folder_paths
-    FOLDER_PATHS_AVAILABLE = True
+    COMFYUI_AVAILABLE = True
 except ImportError:
-    FOLDER_PATHS_AVAILABLE = False
+    COMFYUI_AVAILABLE = False
+
+try:
+    from safetensors import safe_open
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
 
 
-class ModelDownloaderNode:
-    
-    # Map model types to their folder paths
-    MODEL_TYPES = {
-        "checkpoints": "checkpoints",
-        "loras": "loras",
-        "vae": "vae",
-        "embeddings": "embeddings",
-        "controlnet": "controlnet",
-        "upscale_models": "upscale_models",
-        "clip": "clip",
-        "clip_vision": "clip_vision",
-        "style_models": "style_models",
-        "unet": "unet"
-    }
+class CloudModelDownloader:
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "url": ("STRING", {"default": "https://", "multiline": False}),
-                "model_type": (list(cls.MODEL_TYPES.keys()), {"default": "checkpoints"}),
+                "url": ("STRING", {"default": "", "multiline": True}),
             },
             "optional": {
-                "filename": ("STRING", {"default": "", "multiline": False}),
-                "auth_token": ("STRING", {"default": "", "multiline": False}),
+                "filename": ("STRING", {"default": ""}),
+                "model_type": (["auto", "checkpoints", "loras", "vae", "controlnet", "embeddings", "upscale_models"], {"default": "auto"}),
+                "rclone_remote": ("STRING", {"default": ""}),
             }
         }
     
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("file_path",)
-    FUNCTION = "download_model"
-    CATEGORY = "Model Management"
+    RETURN_NAMES = ("status",)
+    FUNCTION = "download"
+    CATEGORY = "model_management"
     OUTPUT_NODE = True
     
-    def _extract_filename(self, url, headers=None):
-        """Extract filename from URL or Content-Disposition header"""
-        # Try to get filename from Content-Disposition header
-        if headers and 'Content-Disposition' in headers:
-            import re
-            cd = headers['Content-Disposition']
-            filename_match = re.findall('filename="?(.+)"?', cd)
-            if filename_match:
-                return filename_match[0]
-        
-        # Fall back to URL parsing
+    def _extract_filename_from_url(self, url):
+        """Extract filename from URL"""
+        from urllib.parse import urlparse, unquote
         parsed = urlparse(url)
         filename = os.path.basename(parsed.path)
-        return filename if filename else "downloaded_model.safetensors"
+        # Remove query params if present
+        filename = filename.split('?')[0]
+        return unquote(filename) if filename else "model.safetensors"
     
-    def _get_model_folder(self, model_type):
-        """Get the correct folder path for the model type"""
-        if FOLDER_PATHS_AVAILABLE:
-            try:
-                folder_list = folder_paths.get_folder_paths(model_type)
-                if folder_list:
-                    return folder_list[0]
-            except:
-                pass
+    def _detect_model_type(self, filepath):
+        """Detect model type from safetensors metadata or file characteristics"""
         
-        # Fallback to default ComfyUI structure
-        base_path = Path("/workspace/ComfyUI/models")
-        return str(base_path / self.MODEL_TYPES[model_type])
-    
-    def _download_with_progress(self, url, dest_path, auth_token=""):
-        """Download file with progress bar using requests"""
-        print(f"\n{'='*60}")
-        print(f"Downloading: {url}")
-        print(f"To: {dest_path}")
-        print(f"{'='*60}")
-        
-        # Set up headers
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        # Add authentication if provided
-        if auth_token and auth_token.strip():
-            headers['Authorization'] = f'Bearer {auth_token.strip()}'
+        if not SAFETENSORS_AVAILABLE:
+            print("⚠ safetensors not available, using size heuristics")
+            return self._detect_by_size(filepath)
         
         try:
-            # Make request with timeout and stream enabled
-            response = requests.get(
-                url, 
-                headers=headers, 
-                stream=True, 
-                timeout=30,  # 30 second timeout
-                allow_redirects=True  # Follow redirects
-            )
-            response.raise_for_status()
-            
-            # Get total file size
-            total_size = int(response.headers.get('content-length', 0))
-            
-            # Download with progress
-            downloaded = 0
-            block_size = 8192
-            
-            with open(dest_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=block_size):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        if total_size > 0:
-                            percent = min(downloaded * 100 / total_size, 100)
-                            bar_length = 50
-                            filled = int(bar_length * percent / 100)
-                            bar = '=' * filled + '-' * (bar_length - filled)
-                            
-                            downloaded_mb = downloaded / (1024 * 1024)
-                            total_mb = total_size / (1024 * 1024)
-                            
-                            sys.stdout.write(f'\r[{bar}] {percent:.1f}% ({downloaded_mb:.1f}MB / {total_mb:.1f}MB)')
-                            sys.stdout.flush()
-            
-            print("\n" + "="*60)
-            print("✓ Download complete!")
-            print("="*60 + "\n")
-            
-        except requests.exceptions.Timeout:
-            raise Exception(f"Download timed out after 30 seconds. The server may be slow or the URL invalid.")
-        except requests.exceptions.HTTPError as e:
-            raise Exception(f"HTTP Error {e.response.status_code}: {e.response.reason}. Check if URL requires authentication.")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Download failed: {str(e)}")
+            with safe_open(filepath, framework="pt") as f:
+                metadata = f.metadata()
+                
+                if metadata:
+                    # Check modelspec.architecture (Stability AI standard)
+                    arch = metadata.get('modelspec.architecture', '').lower()
+                    title = metadata.get('modelspec.title', '').lower()
+                    
+                    if 'lora' in arch or 'lora' in title:
+                        return 'loras'
+                    elif 'vae' in arch or 'vae' in title:
+                        return 'vae'
+                    elif 'controlnet' in arch or 'controlnet' in title:
+                        return 'controlnet'
+                    elif 'upscale' in arch or 'upscale' in title or 'esrgan' in title:
+                        return 'upscale_models'
+                    elif 'unet' in arch or 'checkpoint' in arch or 'sd' in arch:
+                        return 'checkpoints'
+                
+                # Check tensor structure
+                tensor_keys = list(f.keys())
+                
+                # LoRA detection
+                if any('lora' in k.lower() for k in tensor_keys):
+                    return 'loras'
+                
+                # VAE detection
+                if any('vae' in k.lower() for k in tensor_keys):
+                    return 'vae'
+                
+                # ControlNet detection
+                if any('control' in k.lower() for k in tensor_keys):
+                    return 'controlnet'
+                
+                # Small models are usually embeddings or LoRAs
+                if len(tensor_keys) < 50:
+                    return 'embeddings'
+        
+        except Exception as e:
+            print(f"⚠ Metadata detection failed: {e}")
+        
+        # Fallback to size heuristics
+        return self._detect_by_size(filepath)
     
-    def download_model(self, url, model_type, filename="", auth_token=""):
-        """Download model to the appropriate ComfyUI folder"""
+    def _detect_by_size(self, filepath):
+        """Fallback detection based on file size"""
+        size_mb = os.path.getsize(filepath) / (1024 ** 2)
         
-        # Validate URL
-        if not url or url == "https://":
-            raise ValueError("Please provide a valid URL")
+        if size_mb < 10:
+            return 'embeddings'
+        elif size_mb < 500:
+            return 'loras'
+        else:
+            return 'checkpoints'
+    
+    def _get_model_folder(self, model_type):
+        """Get ComfyUI folder path for model type"""
+        if COMFYUI_AVAILABLE:
+            try:
+                folders = folder_paths.get_folder_paths(model_type)
+                if folders:
+                    return folders[0]
+            except Exception as e:
+                print(f"⚠ folder_paths failed: {e}")
         
-        # Quick validation
-        if not url.startswith(('http://', 'https://')):
-            raise ValueError("URL must start with http:// or https://")
+        # Fallback paths
+        base = Path("/workspace/ComfyUI/models")
+        if not base.exists():
+            base = Path.home() / "ComfyUI" / "models"
+        
+        return str(base / model_type)
+    
+    def download(self, url, filename="", model_type="auto", rclone_remote=""):
+        """Download model and auto-sort to correct folder"""
+        
+        if not url or not url.strip():
+            return ("❌ ERROR: No URL provided",)
+        
+        # Clean URL
+        url = url.strip()
         
         # Determine filename
-        if filename and filename.strip():
-            final_filename = filename.strip()
+        if not filename or not filename.strip():
+            filename = self._extract_filename_from_url(url)
         else:
-            final_filename = self._extract_filename(url)
+            filename = filename.strip()
         
-        # Get destination folder
-        dest_folder = self._get_model_folder(model_type)
+        print(f"\n{'='*60}")
+        print(f"Cloud Model Downloader")
+        print(f"{'='*60}")
+        print(f"URL: {url[:80]}...")
+        print(f"Filename: {filename}")
+        
+        # Download to temp location first
+        temp_dir = "/tmp/comfyui_downloads"
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_file = os.path.join(temp_dir, filename)
+        
+        print(f"Downloading to temp: {temp_file}")
+        
+        try:
+            # Download with curl
+            result = subprocess.run(
+                ['curl', '-L', '-o', temp_file, '--progress-bar', url],
+                capture_output=False,
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            return (f"❌ Download failed: {str(e)}",)
+        except FileNotFoundError:
+            return ("❌ curl not found. Install curl first.",)
+        
+        # Detect model type if auto
+        if model_type == "auto":
+            print("🔍 Detecting model type...")
+            detected_type = self._detect_model_type(temp_file)
+            print(f"✓ Detected: {detected_type}")
+        else:
+            detected_type = model_type
+            print(f"✓ Using forced type: {detected_type}")
+        
+        # Handle rclone upload
+        if rclone_remote and rclone_remote.strip():
+            remote_path = f"{rclone_remote.strip()}/models/{detected_type}/{filename}"
+            print(f"📤 Uploading to rclone: {remote_path}")
+            
+            try:
+                subprocess.run(
+                    ['rclone', 'copyto', temp_file, remote_path, '--progress'],
+                    check=True
+                )
+                os.remove(temp_file)
+                return (f"✓ Uploaded to {remote_path}",)
+            except subprocess.CalledProcessError as e:
+                return (f"❌ rclone failed: {str(e)}",)
+            except FileNotFoundError:
+                return ("❌ rclone not found. Install rclone first.",)
+        
+        # Move to ComfyUI folder
+        dest_folder = self._get_model_folder(detected_type)
         os.makedirs(dest_folder, exist_ok=True)
+        dest_path = os.path.join(dest_folder, filename)
         
-        # Full destination path
-        dest_path = os.path.join(dest_folder, final_filename)
-        
-        # Check if file already exists
+        # Check if already exists
         if os.path.exists(dest_path):
-            print(f"⚠ File already exists: {dest_path}")
-            print("Skipping download.")
-            return (dest_path,)
+            print(f"⚠ File exists: {dest_path}")
+            choice = "overwrite"  # or make this configurable
+            if choice != "overwrite":
+                os.remove(temp_file)
+                return (f"⚠ Skipped - file exists: {dest_path}",)
         
-        # Download the model
-        self._download_with_progress(url, dest_path, auth_token)
+        print(f"📁 Moving to: {dest_path}")
+        shutil.move(temp_file, dest_path)
         
-        return (dest_path,)
+        print(f"{'='*60}")
+        print(f"✓ SUCCESS")
+        print(f"{'='*60}\n")
+        
+        return (f"✓ Downloaded to {detected_type}/{filename}",)
 
 
 NODE_CLASS_MAPPINGS = {
-    "ModelDownloaderNode": ModelDownloaderNode
+    "CloudModelDownloader": CloudModelDownloader
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ModelDownloaderNode": "Model Downloader"
+    "CloudModelDownloader": "Cloud Model Downloader"
 }
+
